@@ -1,0 +1,11 @@
+*.sh
+/bin/*
+.env
+settings/*.json
+settings/*.pem
+*.csv
+*.sqlite3
+*.log
+*.pot
+*.pyc
+.ai/*
