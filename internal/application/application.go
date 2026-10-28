@@ -26,11 +26,12 @@ func New(e string) (*Application, error) {
 	}
 
 	logger := logger.New(e)
+	auth := grpcserver.NewAuthServer(logger)
 
 	return &Application{
 		settings: settings,
 		logger:   logger,
-		server:   grpcserver.NewListener(settings, logger),
+		server:   grpcserver.NewListener(settings, logger, auth),
 	}, nil
 }
 
