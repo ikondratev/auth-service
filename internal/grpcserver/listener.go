@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 
+	"github.com/ikondratev/auth-service/internal/authpb"
 	"github.com/ikondratev/auth-service/internal/settings"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -19,10 +20,11 @@ type Listener struct {
 	log      *slog.Logger
 }
 
-func NewListener(s *settings.Settings, l *slog.Logger) *Listener {
+func NewListener(s *settings.Settings, l *slog.Logger, auth *AuthServer) *Listener {
 	engine := grpc.NewServer()
 	hs := health.NewServer()
 	healthpb.RegisterHealthServer(engine, hs)
+	authpb.RegisterAuthServiceServer(engine, auth)
 
 	return &Listener{
 		engine:   engine,

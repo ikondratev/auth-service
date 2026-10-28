@@ -1,0 +1,61 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: |
+          GIT_TAG="${GITHUB_REF_NAME}"
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ -z "$VERSION" ]; then
+            echo "VERSION file is empty"
+            exit 1
+          fi
+          EXPECTED="v${VERSION}"
+          if [ "$GIT_TAG" != "$EXPECTED" ]; then
+            echo "Git tag ${GIT_TAG} does not match VERSION file (${EXPECTED})"
+            exit 1
+          fi
+          echo "tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Fail if tag already exists
+        env:
+          IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if [ -z "$IMAGE" ]; then
+            echo "Repository variable DOCKERHUB_IMAGE is not set"
+            exit 1
+          fi
+          if docker manifest inspect "${IMAGE}:${TAG}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE}:${TAG} already exists. Use a new git tag / VERSION."
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ vars.DOCKERHUB_IMAGE }}:${{ steps.version.outputs.tag }}
