@@ -2,8 +2,11 @@ package settings
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+
+	"github.com/go-playground/validator/v10"
 )
 
 const (
@@ -12,17 +15,36 @@ const (
 )
 
 type Settings struct {
-	Env    string `json:"env"`
-	Server Server `json:"server"`
-	GRPC   GRPC   `json:"grpc"`
+	Env    string `json:"env" validate:"required"`
+	Server Server `json:"server" validate:"required"`
+	GRPC   GRPC   `json:"grpc" validate:"required"`
+	DB     Db     `json:"db" validate:"required"`
+	Auth   Auth   `json:"auth" validate:"required"`
 }
 
 type Server struct {
-	WaitingShutdownSec int `json:"waiting_shutdown_second"`
+	WaitingShutdownSec int `json:"waiting_shutdown_second" validate:"required,min=1"`
 }
 
 type GRPC struct {
-	Port string `json:"port"`
+	Port string `json:"port" validate:"required"`
+}
+
+type Db struct {
+	Url               string `json:"url" validate:"required"`
+	OpenConnection    int    `json:"open_conn" validate:"required,min=1"`
+	MaxIdleConnection int    `json:"max_idle_conn" validate:"required,min=1"`
+	MaxLifeTime       int    `json:"max_life_time" validate:"required"`
+	StartDelay        int    `json:"start_delay" validate:"required"`
+}
+
+type Auth struct {
+	Issuer         string `json:"issuer" validate:"required"`
+	Audience       string `json:"audience" validate:"required"`
+	PrivateKeyPath string `json:"private_key_path" validate:"required"`
+	AccessTTLSec   int    `json:"access_ttl_sec" validate:"required,min=1"`
+	RefreshTTLSec  int    `json:"refresh_ttl_sec" validate:"required,min=1"`
+	Scope          string `json:"scope" validate:"required"`
 }
 
 func New(e string) (*Settings, error) {
@@ -45,17 +67,9 @@ func New(e string) (*Settings, error) {
 }
 
 func validate(s *Settings) error {
-	if s.Env == "" {
-		return ErrValiationEnv
-	}
-
-	var zero GRPC
-	if s.GRPC == zero {
-		return ErrValidationGRPC
-	}
-
-	if s.GRPC.Port == "" {
-		return ErrValidationGRPCPort
+	validate := validator.New(validator.WithRequiredStructEnabled())
+	if err := validate.Struct(s); err != nil {
+		return errors.Join(ErrValiation, fmt.Errorf(":%s", err))
 	}
 
 	return nil

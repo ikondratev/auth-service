@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0] - 2026-11-04
+### Added
+- The access token is an RS256 JWT signed with the service private key. Claims are `sub`, `email`, `scope`, `iss`, `aud`, and `exp`.
+- The refresh token is an opaque value. The client receives the raw token. The database stores its SHA-256 hex digest, a family id, and an expiry taken from `refresh_ttl_sec`.
+- The user and the refresh row are inserted in one transaction. Postgres tables are `users` and `refresh_tokens` (`migrations/000001_create_users.up.sql`).
+- Repositories live in `internal/repo/postgres`. The service opens the transaction through `storage.Transactor`.
+
+### Notes
+
+- `Login`, `Refresh`, and `Logout` still return `Unimplemented`.
+
+[0.3.0]: https://github.com/ikondratev/auth-service/releases/tag/v0.3.0
+
 ## [0.2.0] - 2026-10-28
 
 ### Added
