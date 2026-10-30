@@ -2,6 +2,7 @@ package application
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -11,12 +12,16 @@ import (
 	"github.com/ikondratev/auth-service/internal/grpcserver"
 	"github.com/ikondratev/auth-service/internal/logger"
 	"github.com/ikondratev/auth-service/internal/settings"
+	"github.com/ikondratev/auth-service/internal/storage"
+	"github.com/ikondratev/auth-service/internal/token"
 )
 
 type Application struct {
 	settings *settings.Settings
 	server   *grpcserver.Listener
 	logger   *slog.Logger
+	db       *storage.DB
+	token    *token.Issuer
 }
 
 func New(e string) (*Application, error) {
@@ -26,16 +31,34 @@ func New(e string) (*Application, error) {
 	}
 
 	logger := logger.New(e)
+
+	issToken, err := token.NewIssuer(settings)
+	if err != nil {
+		return nil, err
+	}
+
 	auth := grpcserver.NewAuthServer(logger)
+
+	db, err := storage.New(context.Background(), settings)
+	if err != nil {
+		logger.Error("app: open db error", "err", err)
+		return nil, err
+	}
 
 	return &Application{
 		settings: settings,
 		logger:   logger,
 		server:   grpcserver.NewListener(settings, logger, auth),
+		db:       db,
+		token:    issToken,
 	}, nil
 }
 
-func (a *Application) Run() error {
+func (a *Application) Run() (err error) {
+	defer func() {
+		err = errors.Join(err, a.db.Stop())
+	}()
+
 	chErr := make(chan error)
 	go a.server.Start(chErr)
 
@@ -43,7 +66,7 @@ func (a *Application) Run() error {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
-	case err := <-chErr:
+	case err = <-chErr:
 		if !grpcserver.IsStopped(err) {
 			a.logger.Error("app: stop grpc server error", "err", err)
 			return err
@@ -58,7 +81,7 @@ func (a *Application) Run() error {
 	)
 	defer cancel()
 
-	if err := a.server.Stop(ctx); err != nil {
+	if err = a.server.Stop(ctx); err != nil {
 		a.logger.Error("app: shutdown grpc server error", "err", err)
 		return err
 	}
