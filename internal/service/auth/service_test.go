@@ -1,0 +1,197 @@
+package auth_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/ikondratev/auth-service/internal/domain/session"
+	"github.com/ikondratev/auth-service/internal/domain/user"
+	authsvc "github.com/ikondratev/auth-service/internal/service/auth"
+)
+
+type fakeTx struct {
+	calls int
+}
+
+func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) error {
+	f.calls++
+	return fn(ctx)
+}
+
+type fakeUsers struct {
+	calls int
+	user  *user.User
+	err   error
+}
+
+func (f *fakeUsers) Create(_ context.Context, u *user.User) error {
+	f.calls++
+	copied := *u
+	f.user = &copied
+	return f.err
+}
+
+type fakeSessions struct {
+	calls int
+	token *session.RefreshToken
+	err   error
+}
+
+func (f *fakeSessions) Create(_ context.Context, t *session.RefreshToken) error {
+	f.calls++
+	copied := *t
+	f.token = &copied
+	return f.err
+}
+
+type fakeIssuer struct {
+	calls  int
+	userID string
+	email  string
+	access string
+	exp    time.Time
+	err    error
+}
+
+func (f *fakeIssuer) AccessToken(userID, email string) (string, time.Time, error) {
+	f.calls++
+	f.userID = userID
+	f.email = email
+	return f.access, f.exp, f.err
+}
+
+func newService(users *fakeUsers, sessions *fakeSessions, issuer *fakeIssuer) (*authsvc.Service, *fakeTx) {
+	tx := &fakeTx{}
+	svc := authsvc.New(tx, users, sessions, issuer, 2*time.Hour)
+	return svc, tx
+}
+
+func TestRegisterSuccess(t *testing.T) {
+	users := &fakeUsers{}
+	sessions := &fakeSessions{}
+	exp := time.Now().Add(15 * time.Minute).Truncate(time.Second)
+	issuer := &fakeIssuer{access: "access-token", exp: exp}
+	svc, tx := newService(users, sessions, issuer)
+
+	pair, err := svc.Register(context.Background(), "  Ada@Example.com ", "password1")
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	if tx.calls != 1 || users.calls != 1 || sessions.calls != 1 || issuer.calls != 1 {
+		t.Fatalf("calls tx=%d users=%d sessions=%d issuer=%d", tx.calls, users.calls, sessions.calls, issuer.calls)
+	}
+	if users.user.Email != "ada@example.com" || users.user.Status != 1 {
+		t.Fatalf("user = %+v", users.user)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(users.user.PasswordHash), []byte("password1")); err != nil {
+		t.Fatalf("password hash: %v", err)
+	}
+	if sessions.token.UserID != users.user.ID || sessions.token.ID == "" || sessions.token.FamilyID == "" {
+		t.Fatalf("refresh = %+v", sessions.token)
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(pair.RefreshToken)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("refresh token = %q", pair.RefreshToken)
+	}
+	sum := sha256.Sum256([]byte(pair.RefreshToken))
+	if sessions.token.TokenHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("stored hash does not match refresh token")
+	}
+
+	deadline := time.Now().Add(2 * time.Hour)
+	if sessions.token.ExpiresAt.Before(deadline.Add(-5*time.Second)) || sessions.token.ExpiresAt.After(deadline.Add(5*time.Second)) {
+		t.Fatalf("expires at %s", sessions.token.ExpiresAt)
+	}
+	if pair.AccessToken != "access-token" || !pair.AccessExpiresAt.Equal(exp) || pair.TokenType != "Bearer" {
+		t.Fatalf("pair = %+v", pair)
+	}
+	if issuer.userID != users.user.ID || issuer.email != "ada@example.com" {
+		t.Fatalf("issuer got %s %s", issuer.userID, issuer.email)
+	}
+}
+
+func TestRegisterRejectsInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		email    string
+		password string
+		want     error
+	}{
+		{name: "email", email: "not-an-email", password: "password1", want: authsvc.ErrInvalidEmail},
+		{name: "named address", email: "Ada <ada@example.com>", password: "password1", want: authsvc.ErrInvalidEmail},
+		{name: "short password", email: "ada@example.com", password: "short", want: authsvc.ErrInvalidPassword},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUsers{}
+			sessions := &fakeSessions{}
+			issuer := &fakeIssuer{}
+			svc, tx := newService(users, sessions, issuer)
+
+			_, err := svc.Register(context.Background(), tt.email, tt.password)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("got %v, want %v", err, tt.want)
+			}
+			if tx.calls != 0 || users.calls != 0 || sessions.calls != 0 || issuer.calls != 0 {
+				t.Fatalf("invalid input was saved")
+			}
+		})
+	}
+}
+
+func TestRegisterEmailTaken(t *testing.T) {
+	users := &fakeUsers{err: &pgconn.PgError{Code: "23505"}}
+	sessions := &fakeSessions{}
+	issuer := &fakeIssuer{}
+	svc, _ := newService(users, sessions, issuer)
+
+	_, err := svc.Register(context.Background(), "ada@example.com", "password1")
+	if !errors.Is(err, authsvc.ErrEmailTaken) {
+		t.Fatalf("got %v", err)
+	}
+	if sessions.calls != 0 || issuer.calls != 0 {
+		t.Fatalf("email conflict continued, sessions=%d issuer=%d", sessions.calls, issuer.calls)
+	}
+}
+
+func TestRegisterStopsWhenUserCreateFails(t *testing.T) {
+	dbErr := errors.New("db down")
+	users := &fakeUsers{err: dbErr}
+	sessions := &fakeSessions{}
+	issuer := &fakeIssuer{}
+	svc, _ := newService(users, sessions, issuer)
+
+	_, err := svc.Register(context.Background(), "ada@example.com", "password1")
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("got %v", err)
+	}
+	if sessions.calls != 0 || issuer.calls != 0 {
+		t.Fatalf("create continued after user error")
+	}
+}
+
+func TestRegisterReturnsTokenErrorAfterSave(t *testing.T) {
+	users := &fakeUsers{}
+	sessions := &fakeSessions{}
+	issuer := &fakeIssuer{err: errors.New("sign failed")}
+	svc, _ := newService(users, sessions, issuer)
+
+	_, err := svc.Register(context.Background(), "ada@example.com", "password1")
+	if !errors.Is(err, authsvc.ErrToken) {
+		t.Fatalf("got %v", err)
+	}
+	if users.calls != 1 || sessions.calls != 1 {
+		t.Fatalf("rows were not saved before signing")
+	}
+}

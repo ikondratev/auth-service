@@ -23,6 +23,6 @@ WORKDIR /app
 COPY --from=builder /app/bin/auth /app/auth
 
 USER appuser
-EXPOSE 7777
+EXPOSE 50053
 
-CMD ["/app/http"]
+CMD ["/app/auth"]
