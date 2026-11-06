@@ -29,11 +29,14 @@ func (s *AuthServer) Register(ctx context.Context, req *authpb.RegisterRequest) 
 	pair, err := s.svc.Register(ctx, req.GetEmail(), req.GetPassword())
 	if err != nil {
 		switch {
-		case errors.Is(err, authsvc.ErrInvalidEmail), errors.Is(err, authsvc.ErrInvalidPassword):
-			return nil, status.Error(codes.InvalidArgument, "invalid email or password")
+		case errors.Is(err, authsvc.ErrInvalidEmail):
+			return nil, status.Error(codes.InvalidArgument, "invalid email")
+		case errors.Is(err, authsvc.ErrInvalidPassword):
+			return nil, status.Error(codes.InvalidArgument, "invalid password")
 		case errors.Is(err, authsvc.ErrEmailTaken):
 			return nil, status.Error(codes.AlreadyExists, "email already exists")
 		default:
+			s.logger.Error("register failed", "err", err)
 			return nil, status.Error(codes.Internal, "register failed")
 		}
 	}
