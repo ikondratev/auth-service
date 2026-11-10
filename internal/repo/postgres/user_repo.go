@@ -30,3 +30,22 @@ func (r *UserRepo) Create(ctx context.Context, u *user.User) error {
 	_, err = tx.ExecContext(ctx, query, u.ID, u.Email, u.PasswordHash, u.Status)
 	return err
 }
+
+func (r *UserRepo) Find(ctx context.Context, email string) (*user.User, error) {
+	const query = `
+		SELECT id, email, password_hash, status
+		FROM users
+		WHERE email = $1
+	`
+
+	var u user.User
+	err := r.db.QueryRowContext(ctx, query, email).Scan(
+		&u.ID, &u.Email, &u.PasswordHash, &u.Status,
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &u, nil
+}

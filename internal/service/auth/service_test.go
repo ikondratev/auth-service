@@ -3,6 +3,7 @@ package auth_test
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -27,9 +28,11 @@ func (f *fakeTx) WithinTx(ctx context.Context, fn func(context.Context) error) e
 }
 
 type fakeUsers struct {
-	calls int
-	user  *user.User
-	err   error
+	calls    int
+	user     *user.User
+	err      error
+	findUser *user.User
+	findErr  error
 }
 
 func (f *fakeUsers) Create(_ context.Context, u *user.User) error {
@@ -37,6 +40,17 @@ func (f *fakeUsers) Create(_ context.Context, u *user.User) error {
 	copied := *u
 	f.user = &copied
 	return f.err
+}
+
+func (f *fakeUsers) Find(context.Context, string) (*user.User, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	if f.findUser == nil {
+		return nil, sql.ErrNoRows
+	}
+	copied := *f.findUser
+	return &copied, nil
 }
 
 type fakeSessions struct {
@@ -193,5 +207,179 @@ func TestRegisterReturnsTokenErrorAfterSave(t *testing.T) {
 	}
 	if users.calls != 1 || sessions.calls != 1 {
 		t.Fatalf("rows were not saved before signing")
+	}
+}
+
+func TestLoginSuccess(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("password1"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+
+	users := &fakeUsers{findUser: &user.User{
+		ID:           "user-1",
+		Email:        "ada@example.com",
+		PasswordHash: string(hash),
+		Status:       1,
+	}}
+
+	sessions := &fakeSessions{}
+	exp := time.Now().Add(15 * time.Minute).Truncate(time.Second)
+	issuer := &fakeIssuer{access: "access-token", exp: exp}
+	svc, tx := newService(users, sessions, issuer)
+	pair, err := svc.Login(context.Background(), "  Ada@Example.com ", "password1")
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+
+	if tx.calls != 1 || users.calls != 0 || sessions.calls != 1 || issuer.calls != 1 {
+		t.Fatalf("calls tx=%d users=%d sessions=%d issuer=%d", tx.calls, users.calls, sessions.calls, issuer.calls)
+	}
+
+	if sessions.token.UserID != "user-1" || sessions.token.ID == "" || sessions.token.FamilyID == "" {
+		t.Fatalf("refresh = %+v", sessions.token)
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(pair.RefreshToken)
+	if err != nil || len(raw) != 32 {
+		t.Fatalf("refresh token = %q", pair.RefreshToken)
+	}
+
+	sum := sha256.Sum256([]byte(pair.RefreshToken))
+	if sessions.token.TokenHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("stored hash does not match refresh token")
+	}
+
+	deadline := time.Now().Add(2 * time.Hour)
+	if sessions.token.ExpiresAt.Before(deadline.Add(-5*time.Second)) || sessions.token.ExpiresAt.After(deadline.Add(5*time.Second)) {
+		t.Fatalf("expires at %s", sessions.token.ExpiresAt)
+	}
+
+	if pair.AccessToken != "access-token" || !pair.AccessExpiresAt.Equal(exp) || pair.TokenType != "Bearer" {
+		t.Fatalf("pair = %+v", pair)
+	}
+
+	if issuer.userID != "user-1" || issuer.email != "ada@example.com" {
+		t.Fatalf("issuer got %s %s", issuer.userID, issuer.email)
+	}
+}
+
+func TestLoginRejectsInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		email    string
+		password string
+		want     error
+	}{
+		{name: "email", email: "not-an-email", password: "password1", want: authsvc.ErrInvalidEmail},
+		{name: "named address", email: "Ada <ada@example.com>", password: "password1", want: authsvc.ErrInvalidEmail},
+		{name: "short password", email: "ada@example.com", password: "short", want: authsvc.ErrInvalidPassword},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUsers{}
+			sessions := &fakeSessions{}
+			issuer := &fakeIssuer{}
+			svc, tx := newService(users, sessions, issuer)
+			_, err := svc.Login(context.Background(), tt.email, tt.password)
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("got %v, want %v", err, tt.want)
+			}
+			if tx.calls != 0 || sessions.calls != 0 || issuer.calls != 0 {
+				t.Fatalf("invalid input continued")
+			}
+		})
+	}
+}
+
+func TestLoginStopsWhenSessionCreateFails(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("password1"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	dbErr := errors.New("db down")
+	users := &fakeUsers{findUser: &user.User{
+		ID:           "user-1",
+		Email:        "ada@example.com",
+		PasswordHash: string(hash),
+		Status:       1,
+	}}
+
+	sessions := &fakeSessions{err: dbErr}
+	issuer := &fakeIssuer{}
+	svc, _ := newService(users, sessions, issuer)
+	_, err = svc.Login(context.Background(), "ada@example.com", "password1")
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("got %v", err)
+	}
+	if issuer.calls != 0 {
+		t.Fatalf("issuer called after session error")
+	}
+}
+
+func TestLoginReturnsTokenErrorAfterSave(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("password1"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	users := &fakeUsers{findUser: &user.User{
+		ID:           "user-1",
+		Email:        "ada@example.com",
+		PasswordHash: string(hash),
+		Status:       1,
+	}}
+
+	sessions := &fakeSessions{}
+	issuer := &fakeIssuer{err: errors.New("sign failed")}
+	svc, _ := newService(users, sessions, issuer)
+	_, err = svc.Login(context.Background(), "ada@example.com", "password1")
+	if !errors.Is(err, authsvc.ErrToken) {
+		t.Fatalf("got %v", err)
+	}
+	if sessions.calls != 1 || issuer.calls != 1 {
+		t.Fatalf("session calls=%d issuer calls=%d", sessions.calls, issuer.calls)
+	}
+}
+
+func TestLoginRejectsCredentials(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("password1"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+
+	active := &user.User{
+		ID:           "user-1",
+		Email:        "ada@example.com",
+		PasswordHash: string(hash),
+		Status:       1,
+	}
+
+	disabled := *active
+	disabled.Status = 0
+	tests := []struct {
+		name     string
+		user     *user.User
+		password string
+	}{
+		{name: "missing", password: "password1"},
+		{name: "wrong password", user: active, password: "password2"},
+		{name: "disabled", user: &disabled, password: "password1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUsers{findUser: tt.user}
+			sessions := &fakeSessions{}
+			issuer := &fakeIssuer{}
+			svc, tx := newService(users, sessions, issuer)
+			_, err := svc.Login(context.Background(), "ada@example.com", tt.password)
+			if !errors.Is(err, authsvc.ErrInvalidCredentials) {
+				t.Fatalf("got %v", err)
+			}
+			if tx.calls != 0 || sessions.calls != 0 || issuer.calls != 0 {
+				t.Fatalf("credentials failure continued")
+			}
+		})
 	}
 }
