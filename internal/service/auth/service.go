@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -71,13 +72,8 @@ func New(
 
 func (s *Service) Register(ctx context.Context, email, password string) (TokenPair, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
-	addr, err := mail.ParseAddress(email)
-	if err != nil || addr.Address != email {
-		return TokenPair{}, ErrInvalidEmail
-	}
-
-	if len(password) < minPassLendth {
-		return TokenPair{}, ErrInvalidPassword
+	if err := verify(email, password); err != nil {
+		return TokenPair{}, err
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
@@ -132,4 +128,73 @@ func (s *Service) Register(ctx context.Context, email, password string) (TokenPa
 		AccessExpiresAt: exp,
 		TokenType:       tokenType,
 	}, nil
+}
+
+func (s *Service) Login(ctx context.Context, email, password string) (TokenPair, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if err := verify(email, password); err != nil {
+		return TokenPair{}, err
+	}
+
+	u, err := s.users.Find(ctx, email)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return TokenPair{}, ErrInvalidCredentials
+		}
+		return TokenPair{}, err
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password)); err != nil {
+		return TokenPair{}, ErrInvalidCredentials
+	}
+
+	if u.Status != statuses["active"] {
+		return TokenPair{}, ErrInvalidCredentials
+	}
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return TokenPair{}, errors.Join(ErrToken, fmt.Errorf("refresh token: %w", err))
+	}
+
+	refresh := base64.RawURLEncoding.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(refresh))
+	sessionToken := &session.RefreshToken{
+		ID:        uuid.NewString(),
+		UserID:    u.ID,
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  uuid.NewString(),
+		ExpiresAt: time.Now().Add(s.refreshTTL),
+	}
+
+	if err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+		return s.sessions.Create(ctx, sessionToken)
+	}); err != nil {
+		return TokenPair{}, err
+	}
+
+	access, exp, err := s.tokens.AccessToken(u.ID, u.Email)
+	if err != nil {
+		return TokenPair{}, errors.Join(ErrToken, fmt.Errorf("access token err %w", err))
+	}
+
+	return TokenPair{
+		AccessToken:     access,
+		RefreshToken:    refresh,
+		AccessExpiresAt: exp,
+		TokenType:       tokenType,
+	}, nil
+}
+
+func verify(email, password string) error {
+	addr, err := mail.ParseAddress(email)
+	if err != nil || addr.Address != email {
+		return ErrInvalidEmail
+	}
+
+	if len(password) < minPassLendth {
+		return ErrInvalidPassword
+	}
+
+	return nil
 }

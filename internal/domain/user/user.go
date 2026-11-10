@@ -11,4 +11,5 @@ type User struct {
 
 type Repo interface {
 	Create(ctx context.Context, u *User) error
+	Find(ctx context.Context, email string) (*User, error)
 }

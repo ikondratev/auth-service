@@ -26,7 +26,25 @@ func NewAuthServer(l *slog.Logger, svc *authsvc.Service) *AuthServer {
 }
 
 func (s *AuthServer) Register(ctx context.Context, req *authpb.RegisterRequest) (*authpb.TokenPair, error) {
-	pair, err := s.svc.Register(ctx, req.GetEmail(), req.GetPassword())
+	return s.authHandle(ctx, "register", req.GetEmail(), req.GetPassword(), s.svc.Register)
+}
+func (s *AuthServer) Login(ctx context.Context, req *authpb.LoginRequest) (*authpb.TokenPair, error) {
+	return s.authHandle(ctx, "login", req.GetEmail(), req.GetPassword(), s.svc.Login)
+
+}
+func (s *AuthServer) Refresh(context.Context, *authpb.RefreshRequest) (*authpb.TokenPair, error) {
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
+}
+func (s *AuthServer) Logout(context.Context, *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "unimplemented")
+}
+
+func (s *AuthServer) authHandle(
+	ctx context.Context,
+	opt, email, password string,
+	fn func(context.Context, string, string) (authsvc.TokenPair, error),
+) (*authpb.TokenPair, error) {
+	pair, err := fn(ctx, email, password)
 	if err != nil {
 		switch {
 		case errors.Is(err, authsvc.ErrInvalidEmail):
@@ -35,9 +53,11 @@ func (s *AuthServer) Register(ctx context.Context, req *authpb.RegisterRequest) 
 			return nil, status.Error(codes.InvalidArgument, "invalid password")
 		case errors.Is(err, authsvc.ErrEmailTaken):
 			return nil, status.Error(codes.AlreadyExists, "email already exists")
+		case errors.Is(err, authsvc.ErrInvalidCredentials):
+			return nil, status.Error(codes.Unauthenticated, "invalid email or password")
 		default:
-			s.logger.Error("register failed", "err", err)
-			return nil, status.Error(codes.Internal, "register failed")
+			s.logger.Error(opt+" failed", "err", err)
+			return nil, status.Error(codes.Internal, opt+" failed")
 		}
 	}
 
@@ -47,14 +67,4 @@ func (s *AuthServer) Register(ctx context.Context, req *authpb.RegisterRequest) 
 		AccessExpiresAt: pair.AccessExpiresAt.Unix(),
 		TokenType:       pair.TokenType,
 	}, nil
-
-}
-func (s *AuthServer) Login(context.Context, *authpb.LoginRequest) (*authpb.TokenPair, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
-}
-func (s *AuthServer) Refresh(context.Context, *authpb.RefreshRequest) (*authpb.TokenPair, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
-}
-func (s *AuthServer) Logout(context.Context, *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
 }
