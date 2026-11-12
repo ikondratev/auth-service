@@ -49,3 +49,21 @@ func (r *UserRepo) Find(ctx context.Context, email string) (*user.User, error) {
 
 	return &u, nil
 }
+
+func (r *UserRepo) FindByID(ctx context.Context, id string) (*user.User, error) {
+	const query = `
+		SELECT id, email, password_hash, status
+		FROM users
+		WHERE id = $1
+	`
+
+	var u user.User
+	err := r.db.QueryRowContext(ctx, query, id).Scan(
+		&u.ID, &u.Email, &u.PasswordHash, &u.Status,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	return &u, nil
+}

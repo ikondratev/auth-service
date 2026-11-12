@@ -33,6 +33,7 @@ type fakeUsers struct {
 	err      error
 	findUser *user.User
 	findErr  error
+	findID   string
 }
 
 func (f *fakeUsers) Create(_ context.Context, u *user.User) error {
@@ -53,10 +54,26 @@ func (f *fakeUsers) Find(context.Context, string) (*user.User, error) {
 	return &copied, nil
 }
 
+func (f *fakeUsers) FindByID(_ context.Context, id string) (*user.User, error) {
+	f.findID = id
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	if f.findUser == nil {
+		return nil, sql.ErrNoRows
+	}
+	copied := *f.findUser
+	return &copied, nil
+}
+
 type fakeSessions struct {
-	calls int
-	token *session.RefreshToken
-	err   error
+	calls       int
+	token       *session.RefreshToken
+	err         error
+	findToken   *session.RefreshToken
+	findErr     error
+	revokeCalls int
+	revokeErr   error
 }
 
 func (f *fakeSessions) Create(_ context.Context, t *session.RefreshToken) error {
@@ -64,6 +81,23 @@ func (f *fakeSessions) Create(_ context.Context, t *session.RefreshToken) error 
 	copied := *t
 	f.token = &copied
 	return f.err
+}
+
+func (f *fakeSessions) FindByHash(context.Context, string) (*session.RefreshToken, error) {
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	if f.findToken == nil {
+		return nil, sql.ErrNoRows
+	}
+	copied := *f.findToken
+	return &copied, nil
+}
+
+func (f *fakeSessions) Revoke(context.Context, string, time.Time) error {
+	f.revokeCalls++
+	return f.revokeErr
+
 }
 
 type fakeIssuer struct {
@@ -381,5 +415,185 @@ func TestLoginRejectsCredentials(t *testing.T) {
 				t.Fatalf("credentials failure continued")
 			}
 		})
+	}
+}
+
+func TestRefreshRotatesSession(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	users := &fakeUsers{findUser: &user.User{
+		ID:     "user-1",
+		Email:  "ada@example.com",
+		Status: 1,
+	}}
+	sessions := &fakeSessions{findToken: &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}}
+	exp := time.Now().Add(15 * time.Minute).Truncate(time.Second)
+	issuer := &fakeIssuer{access: "access-token", exp: exp}
+	svc, tx := newService(users, sessions, issuer)
+
+	pair, err := svc.Refresh(context.Background(), "  presented-refresh  ")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	if users.findID != "user-1" {
+		t.Fatalf("find id = %s", users.findID)
+	}
+
+	if tx.calls != 1 || sessions.revokeCalls != 1 || sessions.calls != 1 || issuer.calls != 1 {
+		t.Fatalf("calls tx=%d revoke=%d create=%d issuer=%d", tx.calls, sessions.revokeCalls, sessions.calls, issuer.calls)
+	}
+
+	if sessions.token.FamilyID != "family-1" || sessions.token.UserID != "user-1" || sessions.token.ID == "old-token" {
+		t.Fatalf("refresh = %+v", sessions.token)
+	}
+
+	got := sha256.Sum256([]byte(pair.RefreshToken))
+	if sessions.token.TokenHash != hex.EncodeToString(got[:]) {
+		t.Fatalf("stored hash = %s", sessions.token.TokenHash)
+	}
+
+	if pair.AccessToken != "access-token" || !pair.AccessExpiresAt.Equal(exp) || pair.TokenType != "Bearer" {
+		t.Fatalf("pair = %+v", pair)
+	}
+
+	if issuer.userID != "user-1" || issuer.email != "ada@example.com" {
+		t.Fatalf("issuer user=%s email=%s", issuer.userID, issuer.email)
+	}
+}
+
+func TestRefreshRejectsToken(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	hash := hex.EncodeToString(sum[:])
+	revokedAt := time.Now()
+	active := &user.User{ID: "user-1", Email: "ada@example.com", Status: 1}
+	disabled := *active
+	disabled.Status = 0
+
+	live := &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hash,
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+
+	revoked := *live
+	revoked.RevokedAt = &revokedAt
+	expired := *live
+	expired.ExpiresAt = time.Now().Add(-time.Minute)
+
+	tests := []struct {
+		name   string
+		token  string
+		user   *user.User
+		row    *session.RefreshToken
+		wantTx int
+	}{
+		{name: "empty", token: "   "},
+		{name: "missing", token: presented, user: active, wantTx: 1},
+		{name: "revoked", token: presented, user: active, row: &revoked, wantTx: 1},
+		{name: "expired", token: presented, user: active, row: &expired, wantTx: 1},
+		{name: "disabled", token: presented, user: &disabled, row: live, wantTx: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			users := &fakeUsers{findUser: tt.user}
+			sessions := &fakeSessions{findToken: tt.row}
+			issuer := &fakeIssuer{}
+			svc, tx := newService(users, sessions, issuer)
+
+			_, err := svc.Refresh(context.Background(), tt.token)
+			if !errors.Is(err, authsvc.ErrInvalidRefresh) {
+				t.Fatalf("got %v", err)
+			}
+			if tx.calls != tt.wantTx || sessions.revokeCalls != 0 || sessions.calls != 0 || issuer.calls != 0 {
+				t.Fatalf("calls tx=%d revoke=%d create=%d issuer=%d", tx.calls, sessions.revokeCalls, sessions.calls, issuer.calls)
+			}
+		})
+	}
+}
+
+func TestRefreshStopsWhenWriteFails(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	dbErr := errors.New("db down")
+	users := &fakeUsers{findUser: &user.User{
+		ID:     "user-1",
+		Email:  "ada@example.com",
+		Status: 1,
+	}}
+
+	row := &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+
+	tests := []struct {
+		name       string
+		revokeErr  error
+		createErr  error
+		wantRevoke int
+		wantCreate int
+	}{
+		{name: "revoke", revokeErr: dbErr, wantRevoke: 1},
+		{name: "create", createErr: dbErr, wantRevoke: 1, wantCreate: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessions := &fakeSessions{findToken: row, err: tt.createErr, revokeErr: tt.revokeErr}
+			issuer := &fakeIssuer{}
+			svc, _ := newService(users, sessions, issuer)
+
+			_, err := svc.Refresh(context.Background(), presented)
+			if !errors.Is(err, dbErr) {
+				t.Fatalf("got %v", err)
+			}
+			if sessions.revokeCalls != tt.wantRevoke || sessions.calls != tt.wantCreate || issuer.calls != 0 {
+				t.Fatalf("revoke=%d create=%d issuer=%d", sessions.revokeCalls, sessions.calls, issuer.calls)
+			}
+		})
+	}
+}
+
+func TestRefreshReturnsTokenErrorAfterSave(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	users := &fakeUsers{findUser: &user.User{
+		ID:     "user-1",
+		Email:  "ada@example.com",
+		Status: 1,
+	}}
+
+	sessions := &fakeSessions{findToken: &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+	}}
+
+	issuer := &fakeIssuer{err: errors.New("sign failed")}
+	svc, _ := newService(users, sessions, issuer)
+
+	_, err := svc.Refresh(context.Background(), presented)
+	if !errors.Is(err, authsvc.ErrToken) {
+		t.Fatalf("got %v", err)
+	}
+
+	if sessions.revokeCalls != 1 || sessions.calls != 1 || issuer.calls != 1 {
+		t.Fatalf("revoke=%d create=%d issuer=%d", sessions.revokeCalls, sessions.calls, issuer.calls)
 	}
 }

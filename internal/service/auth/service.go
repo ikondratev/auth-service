@@ -186,6 +186,86 @@ func (s *Service) Login(ctx context.Context, email, password string) (TokenPair,
 	}, nil
 }
 
+func (s *Service) Refresh(ctx context.Context, refreshToken string) (TokenPair, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return TokenPair{}, ErrInvalidRefresh
+	}
+
+	sum := sha256.Sum256([]byte(refreshToken))
+	hash := hex.EncodeToString(sum[:])
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return TokenPair{}, errors.Join(ErrToken, fmt.Errorf("refresh token: %w", err))
+	}
+	next := base64.RawURLEncoding.EncodeToString(raw)
+	nextSum := sha256.Sum256([]byte(next))
+
+	var (
+		userID string
+		email  string
+	)
+
+	err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+		current, err := s.sessions.FindByHash(ctx, hash)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidRefresh
+			}
+			return err
+		}
+		if current.RevokedAt != nil || !current.ExpiresAt.After(time.Now()) {
+			return ErrInvalidRefresh
+		}
+
+		u, err := s.users.FindByID(ctx, current.UserID)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidRefresh
+			}
+			return err
+		}
+		if u.Status != statuses["active"] {
+			return ErrInvalidRefresh
+		}
+
+		if err := s.sessions.Revoke(ctx, current.ID, time.Now()); err != nil {
+			return err
+		}
+
+		sessionToken := &session.RefreshToken{
+			ID:        uuid.NewString(),
+			UserID:    current.UserID,
+			TokenHash: hex.EncodeToString(nextSum[:]),
+			FamilyID:  current.FamilyID,
+			ExpiresAt: time.Now().Add(s.refreshTTL),
+		}
+		if err := s.sessions.Create(ctx, sessionToken); err != nil {
+			return err
+		}
+
+		userID = u.ID
+		email = u.Email
+		return nil
+	})
+	if err != nil {
+		return TokenPair{}, err
+	}
+
+	access, exp, err := s.tokens.AccessToken(userID, email)
+	if err != nil {
+		return TokenPair{}, errors.Join(ErrToken, fmt.Errorf("access token err %w", err))
+	}
+
+	return TokenPair{
+		AccessToken:     access,
+		RefreshToken:    next,
+		AccessExpiresAt: exp,
+		TokenType:       tokenType,
+	}, nil
+}
+
 func verify(email, password string) error {
 	addr, err := mail.ParseAddress(email)
 	if err != nil || addr.Address != email {

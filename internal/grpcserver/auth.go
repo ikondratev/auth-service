@@ -32,8 +32,22 @@ func (s *AuthServer) Login(ctx context.Context, req *authpb.LoginRequest) (*auth
 	return s.authHandle(ctx, "login", req.GetEmail(), req.GetPassword(), s.svc.Login)
 
 }
-func (s *AuthServer) Refresh(context.Context, *authpb.RefreshRequest) (*authpb.TokenPair, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (s *AuthServer) Refresh(ctx context.Context, req *authpb.RefreshRequest) (*authpb.TokenPair, error) {
+	pair, err := s.svc.Refresh(ctx, req.GetRefreshToken())
+	if err != nil {
+		if errors.Is(err, authsvc.ErrInvalidRefresh) {
+			return nil, status.Error(codes.Unauthenticated, "invalid refresh token")
+		}
+		s.logger.Error("refresh failed", "err", err)
+		return nil, status.Error(codes.Internal, "refresh failed")
+	}
+
+	return &authpb.TokenPair{
+		AccessToken:     pair.AccessToken,
+		RefreshToken:    pair.RefreshToken,
+		AccessExpiresAt: pair.AccessExpiresAt.Unix(),
+		TokenType:       pair.TokenType,
+	}, nil
 }
 func (s *AuthServer) Logout(context.Context, *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "unimplemented")
