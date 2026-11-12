@@ -10,4 +10,5 @@ var (
 	ErrEmailTaken         = errors.New("auth: Email already registred")
 	ErrToken              = errors.New("auth: token erorr")
 	ErrInvalidCredentials = errors.New("auth: invalid credentials")
+	ErrInvalidRefresh     = errors.New("auth: invalid refresh token")
 )
