@@ -18,4 +18,5 @@ type Repo interface {
 	Create(ctx context.Context, t *RefreshToken) error
 	FindByHash(ctx context.Context, tokenHash string) (*RefreshToken, error)
 	Revoke(ctx context.Context, id string, at time.Time) error
+	RevokeFamily(ctx context.Context, familyID string, at time.Time) error
 }

@@ -205,6 +205,7 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (TokenPair, 
 	var (
 		userID string
 		email  string
+		reused bool
 	)
 
 	err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
@@ -215,7 +216,13 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (TokenPair, 
 			}
 			return err
 		}
-		if current.RevokedAt != nil || !current.ExpiresAt.After(time.Now()) {
+
+		if current.RevokedAt != nil {
+			reused = true
+			return s.sessions.RevokeFamily(ctx, current.FamilyID, time.Now())
+		}
+
+		if !current.ExpiresAt.After(time.Now()) {
 			return ErrInvalidRefresh
 		}
 
@@ -249,8 +256,13 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (TokenPair, 
 		email = u.Email
 		return nil
 	})
+
 	if err != nil {
 		return TokenPair{}, err
+	}
+
+	if reused {
+		return TokenPair{}, ErrInvalidRefresh
 	}
 
 	access, exp, err := s.tokens.AccessToken(userID, email)
@@ -264,6 +276,27 @@ func (s *Service) Refresh(ctx context.Context, refreshToken string) (TokenPair, 
 		AccessExpiresAt: exp,
 		TokenType:       tokenType,
 	}, nil
+}
+
+func (s *Service) Logout(ctx context.Context, refreshToken string) error {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return ErrInvalidRefresh
+	}
+
+	sum := sha256.Sum256([]byte(refreshToken))
+	hash := hex.EncodeToString(sum[:])
+
+	return s.tx.WithinTx(ctx, func(ctx context.Context) error {
+		current, err := s.sessions.FindByHash(ctx, hash)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrInvalidRefresh
+			}
+			return err
+		}
+		return s.sessions.RevokeFamily(ctx, current.FamilyID, time.Now())
+	})
 }
 
 func verify(email, password string) error {
