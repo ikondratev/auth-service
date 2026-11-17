@@ -67,13 +67,16 @@ func (f *fakeUsers) FindByID(_ context.Context, id string) (*user.User, error) {
 }
 
 type fakeSessions struct {
-	calls       int
-	token       *session.RefreshToken
-	err         error
-	findToken   *session.RefreshToken
-	findErr     error
-	revokeCalls int
-	revokeErr   error
+	calls         int
+	token         *session.RefreshToken
+	err           error
+	findToken     *session.RefreshToken
+	findErr       error
+	revokeCalls   int
+	revokeErr     error
+	familyRevokes int
+	familyErr     error
+	revokedFamily string
 }
 
 func (f *fakeSessions) Create(_ context.Context, t *session.RefreshToken) error {
@@ -98,6 +101,12 @@ func (f *fakeSessions) Revoke(context.Context, string, time.Time) error {
 	f.revokeCalls++
 	return f.revokeErr
 
+}
+
+func (f *fakeSessions) RevokeFamily(_ context.Context, familyID string, _ time.Time) error {
+	f.familyRevokes++
+	f.revokedFamily = familyID
+	return f.familyErr
 }
 
 type fakeIssuer struct {
@@ -472,7 +481,6 @@ func TestRefreshRejectsToken(t *testing.T) {
 	presented := "presented-refresh"
 	sum := sha256.Sum256([]byte(presented))
 	hash := hex.EncodeToString(sum[:])
-	revokedAt := time.Now()
 	active := &user.User{ID: "user-1", Email: "ada@example.com", Status: 1}
 	disabled := *active
 	disabled.Status = 0
@@ -485,8 +493,6 @@ func TestRefreshRejectsToken(t *testing.T) {
 		ExpiresAt: time.Now().Add(time.Hour),
 	}
 
-	revoked := *live
-	revoked.RevokedAt = &revokedAt
 	expired := *live
 	expired.ExpiresAt = time.Now().Add(-time.Minute)
 
@@ -499,7 +505,6 @@ func TestRefreshRejectsToken(t *testing.T) {
 	}{
 		{name: "empty", token: "   "},
 		{name: "missing", token: presented, user: active, wantTx: 1},
-		{name: "revoked", token: presented, user: active, row: &revoked, wantTx: 1},
 		{name: "expired", token: presented, user: active, row: &expired, wantTx: 1},
 		{name: "disabled", token: presented, user: &disabled, row: live, wantTx: 1},
 	}
@@ -515,8 +520,9 @@ func TestRefreshRejectsToken(t *testing.T) {
 			if !errors.Is(err, authsvc.ErrInvalidRefresh) {
 				t.Fatalf("got %v", err)
 			}
-			if tx.calls != tt.wantTx || sessions.revokeCalls != 0 || sessions.calls != 0 || issuer.calls != 0 {
-				t.Fatalf("calls tx=%d revoke=%d create=%d issuer=%d", tx.calls, sessions.revokeCalls, sessions.calls, issuer.calls)
+
+			if tx.calls != tt.wantTx || sessions.revokeCalls != 0 || sessions.familyRevokes != 0 || sessions.calls != 0 || issuer.calls != 0 {
+				t.Fatalf("calls tx=%d revoke=%d family=%d create=%d issuer=%d", tx.calls, sessions.revokeCalls, sessions.familyRevokes, sessions.calls, issuer.calls)
 			}
 		})
 	}
@@ -595,5 +601,127 @@ func TestRefreshReturnsTokenErrorAfterSave(t *testing.T) {
 
 	if sessions.revokeCalls != 1 || sessions.calls != 1 || issuer.calls != 1 {
 		t.Fatalf("revoke=%d create=%d issuer=%d", sessions.revokeCalls, sessions.calls, issuer.calls)
+	}
+}
+
+func TestLogoutRevokesFamily(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	revokedAt := time.Now()
+
+	users := &fakeUsers{}
+	sessions := &fakeSessions{findToken: &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(-time.Minute),
+		RevokedAt: &revokedAt,
+	}}
+
+	issuer := &fakeIssuer{}
+	svc, tx := newService(users, sessions, issuer)
+	err := svc.Logout(context.Background(), "  presented-refresh  ")
+	if err != nil {
+		t.Fatalf("Logout: %v", err)
+	}
+
+	if tx.calls != 1 || sessions.familyRevokes != 1 || sessions.revokedFamily != "family-1" {
+		t.Fatalf("tx=%d family=%d id=%s", tx.calls, sessions.familyRevokes, sessions.revokedFamily)
+	}
+
+	if sessions.revokeCalls != 0 || sessions.calls != 0 || issuer.calls != 0 || users.findID != "" {
+		t.Fatalf("revoke=%d create=%d issuer=%d find=%s", sessions.revokeCalls, sessions.calls, issuer.calls, users.findID)
+	}
+}
+
+func TestRefreshReuseRevokesFamily(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+
+	revokedAt := time.Now()
+	users := &fakeUsers{findUser: &user.User{
+		ID:     "user-1",
+		Email:  "ada@example.com",
+		Status: 1,
+	}}
+
+	sessions := &fakeSessions{findToken: &session.RefreshToken{
+		ID:        "old-token",
+		UserID:    "user-1",
+		TokenHash: hex.EncodeToString(sum[:]),
+		FamilyID:  "family-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		RevokedAt: &revokedAt,
+	}}
+
+	issuer := &fakeIssuer{}
+	svc, tx := newService(users, sessions, issuer)
+	_, err := svc.Refresh(context.Background(), presented)
+	if !errors.Is(err, authsvc.ErrInvalidRefresh) {
+		t.Fatalf("got %v", err)
+	}
+
+	if tx.calls != 1 || sessions.familyRevokes != 1 || sessions.revokedFamily != "family-1" {
+		t.Fatalf("tx=%d family=%d id=%s", tx.calls, sessions.familyRevokes, sessions.revokedFamily)
+	}
+
+	if sessions.revokeCalls != 0 || sessions.calls != 0 || issuer.calls != 0 {
+		t.Fatalf("revoke=%d create=%d issuer=%d", sessions.revokeCalls, sessions.calls, issuer.calls)
+	}
+}
+
+func TestLogoutRejectsToken(t *testing.T) {
+	presented := "presented-refresh"
+
+	tests := []struct {
+		name   string
+		token  string
+		wantTx int
+	}{
+		{name: "empty", token: "   "},
+		{name: "missing", token: presented, wantTx: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sessions := &fakeSessions{}
+			svc, tx := newService(&fakeUsers{}, sessions, &fakeIssuer{})
+
+			err := svc.Logout(context.Background(), tt.token)
+			if !errors.Is(err, authsvc.ErrInvalidRefresh) {
+				t.Fatalf("got %v", err)
+			}
+
+			if tx.calls != tt.wantTx || sessions.familyRevokes != 0 {
+				t.Fatalf("tx=%d family=%d", tx.calls, sessions.familyRevokes)
+			}
+		})
+	}
+}
+
+func TestLogoutReturnsFamilyError(t *testing.T) {
+	presented := "presented-refresh"
+	sum := sha256.Sum256([]byte(presented))
+	dbErr := errors.New("db down")
+	sessions := &fakeSessions{
+		findToken: &session.RefreshToken{
+			ID:        "old-token",
+			UserID:    "user-1",
+			TokenHash: hex.EncodeToString(sum[:]),
+			FamilyID:  "family-1",
+			ExpiresAt: time.Now().Add(time.Hour),
+		},
+		familyErr: dbErr,
+	}
+	svc, _ := newService(&fakeUsers{}, sessions, &fakeIssuer{})
+
+	err := svc.Logout(context.Background(), presented)
+	if !errors.Is(err, dbErr) {
+		t.Fatalf("got %v", err)
+	}
+
+	if sessions.familyRevokes != 1 {
+		t.Fatalf("family=%d", sessions.familyRevokes)
 	}
 }

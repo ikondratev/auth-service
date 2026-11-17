@@ -85,3 +85,19 @@ func (r *RefreshRepo) Revoke(ctx context.Context, id string, at time.Time) error
 
 	return nil
 }
+
+func (r *RefreshRepo) RevokeFamily(ctx context.Context, familyID string, at time.Time) error {
+	tx, err := requireTx(ctx)
+	if err != nil {
+		return err
+	}
+
+	const query = `
+		UPDATE refresh_tokens
+		SET revoked_at = $2
+		WHERE family_id = $1 AND revoked_at IS NULL
+	`
+
+	_, err = tx.ExecContext(ctx, query, familyID, at)
+	return err
+}

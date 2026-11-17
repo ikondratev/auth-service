@@ -49,8 +49,15 @@ func (s *AuthServer) Refresh(ctx context.Context, req *authpb.RefreshRequest) (*
 		TokenType:       pair.TokenType,
 	}, nil
 }
-func (s *AuthServer) Logout(context.Context, *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "unimplemented")
+func (s *AuthServer) Logout(ctx context.Context, req *authpb.LogoutRequest) (*authpb.LogoutResponse, error) {
+	if err := s.svc.Logout(ctx, req.GetRefreshToken()); err != nil {
+		if errors.Is(err, authsvc.ErrInvalidRefresh) {
+			return nil, status.Error(codes.Unauthenticated, "invalid refresh token")
+		}
+		s.logger.Error("logout failed", "err", err)
+		return nil, status.Error(codes.Internal, "logout failed")
+	}
+	return &authpb.LogoutResponse{}, nil
 }
 
 func (s *AuthServer) authHandle(
