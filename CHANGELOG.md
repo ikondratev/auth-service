@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0] - 2026-11-17
+
+### Added
+
+- `Login` checks the email and password, rejects a missing, wrong, or disabled account with one credentials error, and starts a new refresh family.
+- `Refresh` loads the presented token by its hash inside a transaction (`SELECT ... FOR UPDATE`), revokes that row, and inserts the next token with the same `family_id`. 
+- `Logout` revokes every live row in the presented token's family, including when that token is already revoked or expired. The current access token stays valid until it expires.
+- gRPC status mapping: invalid email or password is `InvalidArgument`, a taken email is `AlreadyExists`, bad credentials or a bad refresh token is `Unauthenticated`, and a store or signing failure is `Internal`.
+- Repository tests in `internal/repo/postgres` run the refresh SQL against Postgres when `AUTH_TEST_DSN` is set. CI starts Postgres 16 and sets that variable (`.github/workflows/ci.yml`).
+
+[0.4.0]: https://github.com/ikondratev/auth-service/releases/tag/v0.4.0
+
 ## [0.3.0] - 2026-11-04
 ### Added
 - The access token is an RS256 JWT signed with the service private key. Claims are `sub`, `email`, `scope`, `iss`, `aud`, and `exp`.
